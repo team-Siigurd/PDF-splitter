@@ -6,7 +6,6 @@ services:
     region: frankfurt
     healthCheckPath: /health
     autoDeployTrigger: commit
-    maxShutdownDelaySeconds: 300
     envVars:
       - key: SPLITTER_API_KEY
         sync: false
