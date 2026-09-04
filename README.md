@@ -241,6 +241,39 @@ Når jobbet er færdigt, indeholder svaret `parts[]`:
 }
 ```
 
+Hver `download_url` er nu signeret og gælder i op til en time. Derfor kan den
+sendes direkte til OpenAI Responses API som `file_url`; OpenAI behøver ikke
+kende `SPLITTER_API_KEY`. Linket er kun gyldigt for den konkrete PDF-del og
+holder op med at virke, når signaturen udløber eller jobbet slettes.
+
+Eksempel på direkte brug i Responses API:
+
+```json
+{
+  "model": "gpt-5.4-mini",
+  "text": { "format": { "type": "json_object" } },
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_file",
+          "file_url": "{{Iterator: download_url}}"
+        },
+        {
+          "type": "input_text",
+          "text": "Returnér JSON med: forfattere (array) og highlights (array af text). Find kun understreget/markeret tekst. JSON."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Det eksisterende `X-API-Key` er fortsat påkrævet til at starte, kontrollere og
+slette jobs. Det kan også stadig bruges som header ved manuel download af en
+PDF-del.
+
 ## 7. Download og behandl delene i Make
 
 1. Brug en Iterator på `parts[]`.

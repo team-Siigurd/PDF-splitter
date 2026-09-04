@@ -29,13 +29,17 @@ from pathlib import Path
 from typing import Any
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/siigurd-pdf-splitter-jobs")).resolve()
 API_KEY = os.getenv("SPLITTER_API_KEY", "")
 MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", "500000000"))
 DEFAULT_MAX_PART_BYTES = int(os.getenv("DEFAULT_MAX_PART_BYTES", "45000000"))
 ABSOLUTE_MAX_PART_BYTES = 45_000_000
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", "3600"))
+SIGNED_URL_TTL_SECONDS = min(
+    FILE_TTL_SECONDS,
+    max(60, int(os.getenv("SIGNED_URL_TTL_SECONDS", "3600"))),
+)
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "1")))
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -92,6 +96,24 @@ def update_status(job_id: str, **changes: Any) -> dict[str, Any]:
 
 def is_valid_job_id(value: str) -> bool:
     return bool(re.fullmatch(r"[a-f0-9]{32}", value))
+
+
+def file_signature(job_id: str, filename: str, expires: int) -> str:
+    """Create a signature scoped to one job, filename, and expiration time."""
+    message = f"{job_id}\n{filename}\n{expires}".encode("utf-8")
+    return hmac.new(API_KEY.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def signed_file_path(job_id: str, filename: str) -> tuple[str, int]:
+    expires = int(time.time()) + SIGNED_URL_TTL_SECONDS
+    path = f"/files/{job_id}/{urllib.parse.quote(filename)}"
+    query = urllib.parse.urlencode(
+        {
+            "expires": expires,
+            "signature": file_signature(job_id, filename, expires),
+        }
+    )
+    return f"{path}?{query}", expires
 
 
 def host_is_allowed(hostname: str | None) -> bool:
@@ -426,9 +448,10 @@ def public_status(status: dict[str, Any]) -> dict[str, Any]:
         parts = []
         for part in result.get("parts", []):
             item = dict(part)
-            path = f"/files/{result['job_id']}/{urllib.parse.quote(part['filename'])}"
+            path, expires = signed_file_path(result["job_id"], part["filename"])
             item["download_path"] = path
             item["download_url"] = PUBLIC_BASE_URL + path if PUBLIC_BASE_URL else None
+            item["download_url_expires_epoch"] = expires
             parts.append(item)
         result["parts"] = parts
     return result
@@ -439,7 +462,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format_string: str, *args: Any) -> None:
         # Do not log request bodies or OneDrive URLs.
-        print(f"{self.address_string()} - {format_string % args}", flush=True)
+        message = format_string % args
+        message = re.sub(r"([?&]signature=)[^&\s]+", r"\1[redacted]", message)
+        print(f"{self.address_string()} - {message}", flush=True)
 
     def send_json(
         self,
@@ -468,6 +493,45 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return False
         if not hmac.compare_digest(provided, API_KEY):
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized."})
+            return False
+        return True
+
+    def authorized_file_download(
+        self,
+        parsed: urllib.parse.ParseResult,
+        job_id: str,
+        filename: str,
+    ) -> bool:
+        """Allow either the API-key header or a short-lived signed file URL."""
+        if not API_KEY:
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "SPLITTER_API_KEY is not configured on the server."},
+            )
+            return False
+
+        provided = self.headers.get("X-API-Key", "")
+        if provided and hmac.compare_digest(provided, API_KEY):
+            return True
+
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        expires_values = query.get("expires", [])
+        signature_values = query.get("signature", [])
+        if len(expires_values) != 1 or len(signature_values) != 1:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized."})
+            return False
+        try:
+            expires = int(expires_values[0])
+        except ValueError:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized."})
+            return False
+        if expires < int(time.time()):
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Download URL has expired."})
+            return False
+
+        expected = file_signature(job_id, filename, expires)
+        if not hmac.compare_digest(signature_values[0], expected):
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized."})
             return False
         return True
@@ -516,24 +580,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
             return
 
-        if not self.authorized():
-            return
-
-        if len(path_parts) == 2 and path_parts[0] == "jobs":
-            job_id = path_parts[1]
-            if not is_valid_job_id(job_id):
-                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Job not found."})
-                return
-            status = read_status(job_id)
-            if not status:
-                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Job not found or expired."})
-                return
-            self.send_json(HTTPStatus.OK, public_status(status))
-            return
-
         if len(path_parts) == 3 and path_parts[0] == "files":
             job_id = path_parts[1]
             filename = urllib.parse.unquote(path_parts[2])
+            if not self.authorized_file_download(parsed, job_id, filename):
+                return
             if not is_valid_job_id(job_id):
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "File not found."})
                 return
@@ -567,6 +618,21 @@ class APIHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            return
+
+        if not self.authorized():
+            return
+
+        if len(path_parts) == 2 and path_parts[0] == "jobs":
+            job_id = path_parts[1]
+            if not is_valid_job_id(job_id):
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Job not found."})
+                return
+            status = read_status(job_id)
+            if not status:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Job not found or expired."})
+                return
+            self.send_json(HTTPStatus.OK, public_status(status))
             return
 
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
