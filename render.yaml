@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: siigurd-pdf-splitter
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: SPLITTER_API_KEY
+        sync: false
+      - key: MAX_SOURCE_BYTES
+        value: "500000000"
+      - key: DEFAULT_MAX_PART_BYTES
+        value: "45000000"
+      - key: FILE_TTL_SECONDS
+        value: "3600"
+      - key: MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: ALLOWED_DOWNLOAD_HOST_SUFFIXES
+        value: ".sharepoint.com,.sharepointonline.com,.1drv.com,.onedrive.com,.microsoft.com,.storage.live.com"
